@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  api-service:
+    build: ./api-service
+    container_name: api-service
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@database:5432/mydb
+    depends_on:
+      - database
+
+  worker-service:
+    build: ./worker-service
+    container_name: worker-service
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@database:5432/mydb
+    depends_on:
+      - database
+
+  frontend-service:
+    build: ./frontend-service
+    container_name: frontend-service
+    restart: always
+    ports:
+      - "8080:80"
+    depends_on:
+      - api-service
+
+  database:
+    image: postgres:15
+    container_name: database
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=mydb
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:
+
