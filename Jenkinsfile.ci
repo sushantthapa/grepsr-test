@@ -1,0 +1,120 @@
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY = "harbor.grespr.com/test-project"
+        KUBECONFIG_CREDENTIALS = 'kubeconfig-credentials-id'
+        DOCKER_CREDS = 'docker-credentials-id'
+        SONARQUBE_ENV = 'sonarqube-server'
+        GOOGLE_CHAT_WEBHOOK_URL = credentials('google-chat-webhook')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_ID = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.GIT_LAST_COMMIT = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    env.GIT_LAST_AUTHOR = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
+                    env.GIT_LAST_COMMIT_ID = sh(script: 'git log -1 --pretty=%H', returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_ENV}") {
+                    dir('api-service') { sh "sonar-scanner -Dsonar.projectKey=api-service -Dsonar.sources=." }
+                    dir('worker-service') { sh "sonar-scanner -Dsonar.projectKey=worker-service -Dsonar.sources=." }
+                    dir('frontend-service') { sh "sonar-scanner -Dsonar.projectKey=frontend-service -Dsonar.sources=." }
+                }
+            }
+        }
+
+        stage('Build & Test Services') {
+            parallel {
+                stage('API Service') {
+                    steps {
+                        dir('api-service') {
+                            sh 'npm install'
+                            sh 'npm test || true'
+                            sh "docker build -t $REGISTRY/api-service:${GIT_COMMIT_ID} ."
+                        }
+                    }
+                }
+                stage('Worker Service') {
+                    steps {
+                        dir('worker-service') {
+                            sh 'pip install -r requirements.txt'
+                            sh 'pytest || true'
+                            sh "docker build -t $REGISTRY/worker-service:${GIT_COMMIT_ID} ."
+                        }
+                    }
+                }
+                stage('Frontend Service') {
+                    steps {
+                        dir('frontend-service') {
+                            sh 'npm install'
+                            sh 'npm run build'
+                            sh "docker build -t $REGISTRY/frontend-service:${GIT_COMMIT_ID} ."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Security Scan') {
+            steps {
+                sh """
+                trivy image --exit-code 1 --severity HIGH,CRITICAL $REGISTRY/api-service:${GIT_COMMIT_ID} || true
+                trivy image --exit-code 1 --severity HIGH,CRITICAL $REGISTRY/worker-service:${GIT_COMMIT_ID} || true
+                trivy image --exit-code 1 --severity HIGH,CRITICAL $REGISTRY/frontend-service:${GIT_COMMIT_ID} || true
+                """
+            }
+        }
+
+        stage('Push Images') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDS}", usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh "echo $DOCKER_PASS | docker login $REGISTRY -u $DOCKER_USER --password-stdin"
+                    sh "docker push $REGISTRY/api-service:${GIT_COMMIT_ID}"
+                    sh "docker push $REGISTRY/worker-service:${GIT_COMMIT_ID}"
+                    sh "docker push $REGISTRY/frontend-service:${GIT_COMMIT_ID}"
+                }
+            }
+        }
+
+    stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(credentialsId: "${KUBECONFIG_CREDENTIALS}", variable: 'KUBECONFIG')]) {
+                    script {
+                        try {
+                            sh """
+                            kubectl --kubeconfig=$KUBECONFIG set image deployment/api-service api-service=$REGISTRY/api-service:${GIT_COMMIT_ID} -n microservices
+                            kubectl --kubeconfig=$KUBECONFIG rollout status deployment/api-service -n microservices --timeout=60s
+                            """
+                        } catch (Exception e) {
+                            sh "kubectl --kubeconfig=$KUBECONFIG rollout undo deployment/api-service -n microservices"
+                            error "Deployment failed, rolled back to previous revision."
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                String buildResult = currentBuild.currentResult
+                def statusIcons = [SUCCESS: '\\u2714', UNSTABLE: '\\u26a0', FAILURE: '\\u274c']
+                def colors = [SUCCESS: '#5DBCD2', UNSTABLE: '#aca620', FAILURE: '#ff0000']
+                def buildStatusIcon = statusIcons[buildResult] ?: '\\u1F648'
+
+                googlechatnotification url: env.GOOGLE_CHAT_WEBHOOK_URL,
+                message: "${buildStatusIcon} *${currentBuild.currentResult}*\n Job *${env.JOB_NAME}*\n Build Number : *${env.BUILD_NUMBER}*\n Last Commit ```${env.GIT_LAST_COMMIT}```\n Author : *${env.GIT_LAST_AUTHOR}*\n Commit ID : *${env.GIT_LAST_COMMIT_ID}*\n Full details: ${env.BUILD_URL}"
+            }
+        }
+    }
+}
